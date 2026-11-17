@@ -1,114 +1,112 @@
-/// Representa un identificador único de entidad en el ECS.
+
+
+/// Identificador único de entidad en el ECS.
 ///
-/// Internamente, utiliza un valor de 64 bits (`u64`) empaquetado mediante operaciones de bits:
-/// - Los **32 bits superiores** almacenan la **generación** (versión o ciclo de vida del índice).
-/// - Los **32 bits inferiores** almacenan el **índice** base para el acceso a los datos.
+/// Internamente es un `u64` empaquetado:
+/// - Los **32 bits superiores** guardan la **generación**.
+/// - Los **32 bits inferiores** guardan el **índice**.
 ///
-/// Este diseño previene el problema de referencias colgantes (*dangling references* o problema ABA)
-/// cuando se reciclan identificadores de entidades que ya han sido destruidas.
-pub struct Entity(pub u64);
+/// El campo es privado para que nadie pueda fabricar identificadores arbitrarios
+/// saltándose el empaquetado. Solo `EntityManager` crea entidades válidas.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Entity(u64);
 
 impl Entity {
-    /// Extrae y devuelve únicamente el índice de 32 bits de la entidad,
-    /// ignorando los bits de generación.
-    ///
-    /// Este índice se utiliza internamente en el motor para realizar búsquedas directas
-    /// o accesos seguros a los contenedores de componentes y arquetipos.
-    pub fn index(self) -> u32 {
-        (self.0 & EntityManager::INDEX_MASK) as u32
+    const INDEX_MASK: u64 = 0xFFFF_FFFF;
+    const GENERATION_SHIFT: u32 = 32;
+
+    /// Empaqueta índice y generación en un solo `u64`.
+    #[inline]
+    const fn from_parts(index: u32, generation: u32) -> Self {
+        Self(((generation as u64) << Self::GENERATION_SHIFT) | index as u64)
+    }
+
+    /// Índice de 32 bits, sin los bits de generación.
+    #[inline]
+    pub const fn index(self) -> u32 {
+        (self.0 & Self::INDEX_MASK) as u32
+    }
+
+    /// Generación de 32 bits, sin los bits de índice.
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        (self.0 >> Self::GENERATION_SHIFT) as u32
     }
 }
 
-/// Administrador encargado de controlar el ciclo de vida de las entidades en el ECS.
-/// Gestiona la creación, destrucción, el reciclaje eficiente de índices mediante una pila
-/// y la validación de generaciones para garantizar la seguridad de las referencias.
+/// Administrador del ciclo de vida de las entidades.
+///
+/// Reutiliza índices mediante una pila (LIFO) e invalida las referencias viejas
+/// incrementando la generación de la ranura al destruir.
+#[derive(Default)]
 pub struct EntityManager {
-    /// Vector que almacena la generación actual de cada ranura de índice.
-    /// La posición en el vector corresponde al índice de la entidad, y su valor numérico
-    /// indica cuántas veces ha sido reciclada o reutilizada dicha ranura.
+    /// Generación actual de cada ranura. La posición es el índice de la entidad.
     generations: Vec<u32>,
 
-    /// Pila de índices que han quedado libres tras destruir entidades previas.
-    /// Permite reutilizar posiciones de memoria de manera óptima sin inflar el tamaño de las listas.
+    /// Pila de índices libres listos para reutilizarse.
     free_indices: Vec<u32>,
 }
 
 impl EntityManager {
-    /// Máscara de bits para aislar los 32 bits inferiores correspondientes al índice (`0xFFFF_FFFF`).
-    pub const INDEX_MASK: u64 = 0xFFFF_FFFF;
+    /// Generación reservada para ranuras agotadas. Ninguna entidad viva puede tenerla:
+    /// cuando una ranura llega a este valor se retira y no se vuelve a reciclar,
+    /// así la generación nunca da la vuelta (evita el problema ABA).
+    const RETIRED_GENERATION: u32 = u32::MAX;
 
-    /// Desplazamiento de bits (`32`) necesario para ubicar o extraer la generación en la mitad superior del `u64`.
-    pub const GENERATION_SHIFT: u32 = 32;
-
-    /// Crea e inicializa una nueva instancia vacía del administrador de entidades.
+    /// Crea un administrador vacío.
     pub fn new() -> Self {
-        Self {
-            generations: Vec::new(),
-            free_indices: Vec::new(),
+        Self::default()
+    }
+
+    /// Crea una entidad, reciclando una ranura libre si existe.
+    ///
+    /// # Panics
+    /// Si se supera el número máximo de ranuras (`u32::MAX`).
+    pub fn create_entity(&mut self) -> Entity {
+        if let Some(index) = self.free_indices.pop() {
+            Entity::from_parts(index, self.generations[index as usize])
+        } else {
+            let index = u32::try_from(self.generations.len())
+                .expect("se superó el máximo de entidades (u32::MAX)");
+            self.generations.push(0);
+            Entity::from_parts(index, 0)
         }
     }
 
-    /// Crea una nueva entidad o recicla una ranura previamente liberada.
+    /// Destruye una entidad viva. Devuelve `false` si la referencia no es válida
+    /// (índice fuera de rango, generación distinta o ya destruida).
     ///
-    /// - Si existen índices disponibles en la pila `free_indices`, extrae uno y conserva
-    ///   su generación actual (la cual ya fue incrementada de forma segura al destruirse).
-    /// - Si no hay índices libres, extiende el vector de generaciones agregando un nuevo
-    ///   espacio con una generación inicial de `0`.
-    ///
-    /// Retorna una instancia de `Entity` con el bitmask empaquetado de generación e índice.
-    pub fn create_entity(&mut self) -> Entity {
-        let (index, generation) = if let Some(free_idx) = self.free_indices.pop() {
-            (free_idx, self.generations[free_idx as usize])
-        } else {
-            let new_idx = self.generations.len() as u32;
-            self.generations.push(0);
-            (new_idx, 0)
-        };
-
-        let bits = ((generation as u64) << Self::GENERATION_SHIFT) | (index as u64);
-        Entity(bits)
-    }
-
-    /// Destruye una entidad activa en el sistema de manera segura.
-    ///
-    /// Válida que la entidad sea legítima antes de destruirla:
-    /// 1. Extrae el índice y la generación del `u64` de la entidad.
-    /// 2. Comprueba que el índice se encuentre dentro de los límites del vector.
-    /// 3. Verifica que la generación de la entidad coincida exactamente con la registrada
-    ///    en el administrador (evitando dobles eliminaciones o el uso de referencias viejas).
-    ///
-    /// Si la validación es exitosa, incrementa la generación de esa ranura (lo que invalida
-    /// de inmediato cualquier referencia antigua que la poseyera), añade el índice a `free_indices`
-    /// y retorna `true`. Si falla, retorna `false`.
+    /// Si la ranura llega a la generación reservada, se retira definitivamente
+    /// en lugar de volver a `free_indices`.
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
-        let index = (entity.0 & Self::INDEX_MASK) as u32;
-        let generation = (entity.0 >> Self::GENERATION_SHIFT) as u32;
-
-        let idx_usize = index as usize;
-
-        if idx_usize >= self.generations.len() || self.generations[idx_usize] != generation {
+        if !self.is_alive(entity) {
             return false;
         }
 
-        self.generations[idx_usize] += 1;
-        self.free_indices.push(index);
+        let index = entity.index();
+        // Seguro: una entidad viva siempre tiene generación < RETIRED_GENERATION.
+        let next = entity.generation() + 1;
+        self.generations[index as usize] = next;
+
+        if next != Self::RETIRED_GENERATION {
+            self.free_indices.push(index);
+        }
 
         true
     }
 
-    /// Comprueba si una referencia a una entidad sigue estando viva y activa.
-    ///
-    /// Extrae el índice y la generación de la entidad y confirma que el índice
-    /// exista dentro del almacenamiento y que su generación coincida exactamente
-    /// con la versión actual guardada en el administrador.
-    ///
-    /// Retorna `true` si la entidad es completamente válida y activa, o `false` en caso contrario.
+    /// Indica si la entidad sigue viva.
     pub fn is_alive(&self, entity: Entity) -> bool {
-        let index = (entity.0 & Self::INDEX_MASK) as u32;
-        let generation = (entity.0 >> Self::GENERATION_SHIFT) as u32;
+        let generation = entity.generation();
 
-        let idx_usize = index as usize;
-
-        idx_usize < self.generations.len() && self.generations[idx_usize] == generation
+        generation != Self::RETIRED_GENERATION
+            && self
+            .generations
+            .get(entity.index() as usize)
+            .is_some_and(|&g| g == generation)
     }
 }
+
+
+#[cfg(test)]
+mod test;
